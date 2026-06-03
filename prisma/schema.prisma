@@ -1,11 +1,5 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
-  provider = "prisma-client"
-  output   = "../app/generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
@@ -16,7 +10,45 @@ model Product {
   id            String   @id @default(uuid())
   name          String
   specification String?
-  quantity      String
+  sku           String   @unique
+  sellingPrice  Decimal  @map("selling_price")
+  costPrice     Decimal  @map("cost_price")
+  imageUrl      String?  @map("image_url")
   category      String?
-  createdAt     DateTime @default(now())
+  quantity      String?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  transactions InventoryTransaction[]
+
+  @@map("products")
+}
+
+enum TransactionType {
+  SALE
+  PURCHASE
+  ADJUSTMENT
+  RETURN
+}
+
+model InventoryTransaction {
+  id        String          @id @default(uuid())
+  productId String          @map("product_id")
+  type      TransactionType
+  quantity  Int
+  unitPrice Decimal?        @map("unit_price")
+  deviceId  String          @map("device_id")
+  createdAt DateTime        @default(now()) @map("created_at")
+  syncedAt  DateTime?       @map("synced_at")
+
+  product Product @relation(fields: [productId], references: [id])
+
+  @@map("inventory_transactions")
+}
+
+model Device {
+  id         String    @id
+  name       String
+  lastSyncAt DateTime? @map("last_sync_at")
+
+  @@map("devices")
 }
