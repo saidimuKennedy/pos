@@ -5,7 +5,7 @@
 // Bump DB_VERSION whenever a store or index is added.
 
 const DB_NAME = 'pos'
-const DB_VERSION = 3
+const DB_VERSION = 4
 
 let dbPromise: Promise<IDBDatabase> | null = null
 
