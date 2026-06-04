@@ -1,25 +1,39 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
-import { Minus, Plus, ShoppingCart, WifiOff, X } from 'lucide-react'
+import { FileText, Minus, Plus, ShoppingCart, WifiOff, X } from 'lucide-react'
+import { toast } from 'sonner'
 import { create } from '@/lib/db/transactions'
 import { push } from '@/lib/db/syncQueue'
 import { getAll as getProducts } from '@/lib/db/products'
 import { getAll as getCategories } from '@/lib/db/categories'
-import { seedIfEmpty } from '@/lib/db/seed'
+import { getAll as getTransactions } from '@/lib/db/transactions'
+import { seedIfEmpty, syncFromServer } from '@/lib/db/seed'
+import { computeStock, getLowStockItems, LOW_STOCK_THRESHOLD } from '@/lib/stock'
 import type { Product, ProductCategory, InventoryTransaction } from '@/lib/types'
 
 type CartItem = Product & { qty: number }
 
+interface QuoteForm {
+  customerName: string
+  customerEmail: string
+  note: string
+}
+
 export default function POSPage() {
   const [products, setProducts] = useState<Product[]>([])
   const [categories, setCategories] = useState<ProductCategory[]>([])
+  const [allTransactions, setAllTransactions] = useState<InventoryTransaction[]>([])
   const [activeCategoryId, setActiveCategoryId] = useState<string>('all')
   const [cart, setCart] = useState<CartItem[]>([])
   const [offline, setOffline] = useState(false)
   const [receipt, setReceipt] = useState<{ orderId: string; items: CartItem[]; total: number } | null>(null)
   const [checking, setChecking] = useState(false)
+  const [quoteOpen, setQuoteOpen] = useState(false)
+  const [quoteForm, setQuoteForm] = useState<QuoteForm>({ customerName: '', customerEmail: '', note: '' })
+  const [quoteSending, setQuoteSending] = useState(false)
+  const alertedIds = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     const sync = () => setOffline(!navigator.onLine)
@@ -34,11 +48,40 @@ export default function POSPage() {
 
   useEffect(() => {
     async function load() {
-      await seedIfEmpty()
-      const [cats, prods] = await Promise.all([getCategories(), getProducts()])
-      setCategories(cats)
-      setProducts(prods)
-      if (cats.length > 0) setActiveCategoryId(cats[0].id)
+      // Show local data immediately
+      const [cats, prods, txs] = await Promise.all([getCategories(), getProducts(), getTransactions()])
+      if (prods.length > 0) {
+        setCategories(cats)
+        setProducts(prods)
+        setAllTransactions(txs)
+        if (cats.length > 0) setActiveCategoryId(cats[0].id)
+      } else {
+        await seedIfEmpty()
+        const [c, p, t] = await Promise.all([getCategories(), getProducts(), getTransactions()])
+        setCategories(c)
+        setProducts(p)
+        setAllTransactions(t)
+        if (c.length > 0) setActiveCategoryId(c[0].id)
+      }
+      // Background sync
+      const synced = await syncFromServer()
+      if (synced) {
+        const [c, p, t] = await Promise.all([getCategories(), getProducts(), getTransactions()])
+        setCategories(c)
+        setProducts(p)
+        setAllTransactions(t)
+        if (c.length > 0) setActiveCategoryId(c[0].id)
+      }
+
+      // Show toasts for items that are already low on load
+      const low = getLowStockItems(prods, txs)
+      low.forEach(({ product, stock }) => {
+        alertedIds.current.add(product.id)
+        toast.warning(`Low stock: ${product.name}`, {
+          description: `Only ${stock} unit${stock !== 1 ? 's' : ''} left (threshold: ${LOW_STOCK_THRESHOLD})`,
+          duration: 6000,
+        })
+      })
     }
     load()
   }, [])
@@ -67,6 +110,8 @@ export default function POSPage() {
     setChecking(true)
     const orderId = crypto.randomUUID()
     const now = new Date().toISOString()
+    const newTxs: InventoryTransaction[] = []
+
     for (const item of cart) {
       const tx: InventoryTransaction = {
         id: crypto.randomUUID(),
@@ -78,10 +123,65 @@ export default function POSPage() {
       }
       await create(tx)
       await push(tx)
+      newTxs.push(tx)
     }
+
+    const updatedTxs = [...allTransactions, ...newTxs]
+    setAllTransactions(updatedTxs)
     setReceipt({ orderId, items: [...cart], total: subtotal })
     setCart([])
     setChecking(false)
+
+    // Check for newly low-stock items and fire toasts + email
+    const nowLow = getLowStockItems(products, updatedTxs)
+    const newlyLow = nowLow.filter(({ product }) => !alertedIds.current.has(product.id))
+    newlyLow.forEach(({ product, stock }) => {
+      alertedIds.current.add(product.id)
+      toast.warning(`Low stock: ${product.name}`, {
+        description: `Only ${stock} unit${stock !== 1 ? 's' : ''} remaining — please restock`,
+        duration: 8000,
+      })
+    })
+
+    if (newlyLow.length > 0) {
+      fetch('/api/alerts/low-stock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: newlyLow.map(({ product, stock }) => ({
+            name: product.name,
+            sku: product.sku,
+            stock,
+          })),
+        }),
+      }).catch(() => {/* silent — toast already shown */})
+    }
+  }
+
+  async function handleGenerateQuote() {
+    if (!quoteForm.customerName.trim()) {
+      toast.error('Customer name is required')
+      return
+    }
+    setQuoteSending(true)
+    try {
+      const { generateQuotationPDF } = await import('@/lib/pdf')
+      const quoteRef = `QT-${Date.now().toString(36).toUpperCase()}`
+      const doc = generateQuotationPDF({
+        customerName: quoteForm.customerName,
+        customerEmail: quoteForm.customerEmail || undefined,
+        note: quoteForm.note || undefined,
+        quoteRef,
+        date: new Date().toLocaleDateString('en-KE', { year: 'numeric', month: 'long', day: 'numeric' }),
+        items: cart.map((i) => ({ name: i.name, sku: i.sku, qty: i.qty, unitPrice: i.sellingPrice })),
+      })
+      doc.save(`quotation-${quoteRef}.pdf`)
+      toast.success('Quotation downloaded', { description: `Ref: ${quoteRef}` })
+      setQuoteOpen(false)
+      setQuoteForm({ customerName: '', customerEmail: '', note: '' })
+    } finally {
+      setQuoteSending(false)
+    }
   }
 
   return (
@@ -98,7 +198,6 @@ export default function POSPage() {
         <div className="px-6 pt-6 pb-3">
           <h1 className="text-2xl font-semibold tracking-tight mb-4">Point of Sale</h1>
 
-          {/* Category tabs */}
           {categories.length > 0 && (
             <div className="flex gap-1 flex-wrap">
               <button
@@ -122,14 +221,25 @@ export default function POSPage() {
             <p className="text-sm text-gray-500 text-center mt-16">No products in this category</p>
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 pt-3">
-              {visible.map((p) => (
-                <button key={p.id} onClick={() => addToCart(p)}
-                  className="text-left border border-gray-200 rounded-xl p-4 hover:border-blue-400 hover:bg-blue-50 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500">
-                  <p className="font-medium text-sm leading-snug">{p.name}</p>
-                  <p className="text-xs text-gray-500 font-mono mt-0.5">{p.sku}</p>
-                  <p className="text-blue-600 font-semibold mt-2">KES {p.sellingPrice.toLocaleString()}</p>
-                </button>
-              ))}
+              {visible.map((p) => {
+                const stock = computeStock(p.id, allTransactions)
+                const isLow = stock < LOW_STOCK_THRESHOLD
+                return (
+                  <button key={p.id} onClick={() => addToCart(p)}
+                    className={`text-left border rounded-xl p-4 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+                      isLow
+                        ? 'border-amber-300 bg-amber-50 hover:border-amber-400'
+                        : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50'
+                    }`}>
+                    <p className="font-medium text-sm leading-snug">{p.name}</p>
+                    <p className="text-xs text-gray-500 font-mono mt-0.5">{p.sku}</p>
+                    <p className="text-blue-600 font-semibold mt-2">KES {p.sellingPrice.toLocaleString()}</p>
+                    {isLow && (
+                      <p className="text-xs text-amber-600 font-medium mt-1">⚠ {stock} left</p>
+                    )}
+                  </button>
+                )
+              })}
             </div>
           )}
         </div>
@@ -175,10 +285,21 @@ export default function POSPage() {
             <span>Subtotal</span>
             <span>KES {subtotal.toLocaleString()}</span>
           </div>
-          <button onClick={checkout} disabled={cart.length === 0 || checking}
-            className="w-full bg-blue-600 text-white py-2.5 rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-40 transition-colors">
-            {checking ? 'Processing…' : 'Checkout'}
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setQuoteOpen(true)}
+              disabled={cart.length === 0}
+              className="flex items-center gap-1.5 border border-gray-300 px-3 py-2.5 rounded-xl text-sm text-gray-700 hover:bg-gray-100 disabled:opacity-40 transition-colors"
+              title="Generate quotation PDF"
+            >
+              <FileText size={14} />
+              Quote
+            </button>
+            <button onClick={checkout} disabled={cart.length === 0 || checking}
+              className="flex-1 bg-blue-600 text-white py-2.5 rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-40 transition-colors">
+              {checking ? 'Processing…' : 'Checkout'}
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -213,6 +334,79 @@ export default function POSPage() {
                 </Dialog.Close>
               </>
             )}
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      {/* Quotation modal */}
+      <Dialog.Root open={quoteOpen} onOpenChange={setQuoteOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40" />
+          <Dialog.Content className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm z-50 focus:outline-none">
+            <div className="flex items-center justify-between mb-4">
+              <Dialog.Title className="text-lg font-semibold">Generate Quotation</Dialog.Title>
+              <Dialog.Close asChild>
+                <button className="text-gray-500 hover:text-gray-600 p-1 rounded-md"><X size={18} /></button>
+              </Dialog.Close>
+            </div>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Customer Name *</label>
+                <input
+                  type="text"
+                  value={quoteForm.customerName}
+                  onChange={(e) => setQuoteForm((f) => ({ ...f, customerName: e.target.value }))}
+                  placeholder="e.g. John Kamau"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Customer Email (optional)</label>
+                <input
+                  type="email"
+                  value={quoteForm.customerEmail}
+                  onChange={(e) => setQuoteForm((f) => ({ ...f, customerEmail: e.target.value }))}
+                  placeholder="customer@email.com"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Note / Terms (optional)</label>
+                <textarea
+                  value={quoteForm.note}
+                  onChange={(e) => setQuoteForm((f) => ({ ...f, note: e.target.value }))}
+                  placeholder="Valid for 30 days. Payment on delivery."
+                  rows={2}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+                />
+              </div>
+              {/* Preview totals */}
+              <div className="bg-gray-50 rounded-lg p-3 text-xs text-gray-600 space-y-1">
+                {cart.map((i) => (
+                  <div key={i.id} className="flex justify-between">
+                    <span>{i.name} × {i.qty}</span>
+                    <span>KES {(i.sellingPrice * i.qty).toLocaleString()}</span>
+                  </div>
+                ))}
+                <div className="flex justify-between font-semibold text-gray-800 border-t pt-1 mt-1">
+                  <span>Total</span>
+                  <span>KES {subtotal.toLocaleString()}</span>
+                </div>
+              </div>
+            </div>
+            <div className="flex gap-2 mt-5">
+              <Dialog.Close asChild>
+                <button className="flex-1 border border-gray-300 py-2.5 rounded-xl text-sm text-gray-700 hover:bg-gray-50 transition-colors">Cancel</button>
+              </Dialog.Close>
+              <button
+                onClick={handleGenerateQuote}
+                disabled={quoteSending}
+                className="flex-1 bg-blue-600 text-white py-2.5 rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-40 transition-colors flex items-center justify-center gap-1.5"
+              >
+                <FileText size={14} />
+                {quoteSending ? 'Generating…' : 'Download PDF'}
+              </button>
+            </div>
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>

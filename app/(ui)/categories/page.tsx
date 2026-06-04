@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import { getAll as getCategories } from '@/lib/db/categories'
 import { getAll as getProducts } from '@/lib/db/products'
-import { seedIfEmpty } from '@/lib/db/seed'
+import { seedIfEmpty, syncFromServer } from '@/lib/db/seed'
 import CategoryModal from '@/components/CategoryModal'
 import type { ProductCategory } from '@/lib/types'
 
@@ -12,16 +12,28 @@ export default function CategoriesPage() {
   const [countMap, setCountMap] = useState<Record<string, number>>({})
   const [selected, setSelected] = useState<ProductCategory | null>(null)
 
+  async function refreshLocal() {
+    const [cats, prods] = await Promise.all([getCategories(), getProducts()])
+    setCategories(cats)
+    const counts: Record<string, number> = {}
+    for (const p of prods) counts[p.categoryId] = (counts[p.categoryId] ?? 0) + 1
+    setCountMap(counts)
+  }
+
   useEffect(() => {
     async function load() {
-      await seedIfEmpty()
       const [cats, prods] = await Promise.all([getCategories(), getProducts()])
-      setCategories(cats)
-      const counts: Record<string, number> = {}
-      for (const p of prods) {
-        counts[p.categoryId] = (counts[p.categoryId] ?? 0) + 1
+      if (prods.length > 0) {
+        setCategories(cats)
+        const counts: Record<string, number> = {}
+        for (const p of prods) counts[p.categoryId] = (counts[p.categoryId] ?? 0) + 1
+        setCountMap(counts)
+      } else {
+        await seedIfEmpty()
+        await refreshLocal()
       }
-      setCountMap(counts)
+      const synced = await syncFromServer()
+      if (synced) await refreshLocal()
     }
     load()
   }, [])

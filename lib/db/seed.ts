@@ -6,7 +6,14 @@ function slugify(str: string): string {
   return str.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
 }
 
-async function syncFromServer(): Promise<boolean> {
+const SYNC_TTL = 5 * 60 * 1000 // 5 minutes
+const SYNC_TS_KEY = 'pos_last_sync'
+
+export async function syncFromServer(): Promise<boolean> {
+  if (typeof window !== 'undefined') {
+    const last = parseInt(localStorage.getItem(SYNC_TS_KEY) ?? '0', 10)
+    if (Date.now() - last < SYNC_TTL) return false
+  }
   try {
     const catRes = await fetch('/api/products/categories')
     if (!catRes.ok) return false
@@ -43,6 +50,9 @@ async function syncFromServer(): Promise<boolean> {
     if (categories.length > 0) await upsertCategories(categories)
     if (products.length > 0) await upsertProducts(products)
 
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(SYNC_TS_KEY, String(Date.now()))
+    }
     return true
   } catch {
     return false

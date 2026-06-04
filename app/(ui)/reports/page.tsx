@@ -1,11 +1,13 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { BarChart3, Package, TrendingUp, Download } from 'lucide-react'
+import { BarChart3, Download, FileText, Package, TrendingUp } from 'lucide-react'
+import { toast } from 'sonner'
 import { getAll as getTransactions } from '@/lib/db/transactions'
 import { getAll as getProducts } from '@/lib/db/products'
 import { getAll as getCategories } from '@/lib/db/categories'
-import { seedIfEmpty } from '@/lib/db/seed'
+import { seedIfEmpty, syncFromServer } from '@/lib/db/seed'
+import { computeStock, getLowStockItems, LOW_STOCK_THRESHOLD } from '@/lib/stock'
 import type { InventoryTransaction, Product, ProductCategory } from '@/lib/types'
 
 type Range = 'today' | 'week' | 'month' | 'all'
@@ -36,8 +38,6 @@ interface ReportRow {
   netStock: number
 }
 
-const LOW_STOCK = 5
-
 export default function ReportsPage() {
   const [range, setRange] = useState<Range>('today')
   const [transactions, setTransactions] = useState<InventoryTransaction[]>([])
@@ -45,14 +45,28 @@ export default function ReportsPage() {
   const [categories, setCategories] = useState<ProductCategory[]>([])
   const [loading, setLoading] = useState(true)
 
+  async function refreshLocal() {
+    const [txs, prods, cats] = await Promise.all([getTransactions(), getProducts(), getCategories()])
+    setTransactions(txs)
+    setProducts(prods)
+    setCategories(cats)
+    setLoading(false)
+  }
+
   useEffect(() => {
     async function load() {
-      await seedIfEmpty()
       const [txs, prods, cats] = await Promise.all([getTransactions(), getProducts(), getCategories()])
-      setTransactions(txs)
-      setProducts(prods)
-      setCategories(cats)
-      setLoading(false)
+      if (prods.length > 0) {
+        setTransactions(txs)
+        setProducts(prods)
+        setCategories(cats)
+        setLoading(false)
+      } else {
+        await seedIfEmpty()
+        await refreshLocal()
+      }
+      const synced = await syncFromServer()
+      if (synced) await refreshLocal()
     }
     load()
   }, [])
@@ -69,7 +83,6 @@ export default function ReportsPage() {
   const revenue   = sales.reduce((sum, t) => sum + (productMap[t.productId]?.sellingPrice ?? 0) * t.quantity, 0)
   const unitsSold = sales.reduce((sum, t) => sum + t.quantity, 0)
 
-  // Per-product summary
   const allProductIds = Array.from(new Set(filtered.map((t) => t.productId)))
   const rows: ReportRow[] = allProductIds.map((id) => {
     const p = productMap[id]
@@ -83,17 +96,12 @@ export default function ReportsPage() {
       sold,
       stocked,
       revenue:   sold * (p?.sellingPrice ?? 0),
-      netStock:  stocked - sold,
+      netStock:  computeStock(id, transactions),
     }
   }).sort((a, b) => b.revenue - a.revenue)
 
-  // Low stock: products with net stock below threshold across ALL time
-  const allTimeByProduct = new Map<string, number>()
-  for (const tx of transactions) {
-    const prev = allTimeByProduct.get(tx.productId) ?? 0
-    allTimeByProduct.set(tx.productId, tx.type === 'STOCK_IN' ? prev + tx.quantity : prev - tx.quantity)
-  }
-  const lowStockCount = products.filter((p) => (allTimeByProduct.get(p.id) ?? 0) < LOW_STOCK).length
+  const lowStockItems = getLowStockItems(products, transactions)
+  const lowStockCount = lowStockItems.length
 
   function exportCsv() {
     const header = 'Product,SKU,Category,Sold,Stocked,Revenue,Net Stock'
@@ -109,12 +117,35 @@ export default function ReportsPage() {
     URL.revokeObjectURL(url)
   }
 
+  async function exportPDF() {
+    try {
+      const { generateCOBReportPDF } = await import('@/lib/pdf')
+      const rangeLabel = RANGES.find((r) => r.value === range)?.label ?? range
+      const doc = generateCOBReportPDF({
+        dateLabel: `${rangeLabel} — ${new Date().toLocaleDateString('en-KE', { year: 'numeric', month: 'long', day: 'numeric' })}`,
+        revenue,
+        unitsSold,
+        lowStockCount,
+        rows,
+        lowStockItems: lowStockItems.map(({ product, stock }) => ({
+          name: product.name,
+          sku: product.sku,
+          stock,
+        })),
+      })
+      doc.save(`cob-report-${range}-${new Date().toISOString().slice(0, 10)}.pdf`)
+      toast.success('Report downloaded as PDF')
+    } catch {
+      toast.error('Failed to generate PDF')
+    }
+  }
+
   return (
     <div className="flex-1 overflow-y-auto p-6">
     <div className="max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-semibold tracking-tight">Reports</h1>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {/* Range selector */}
           <div className="flex rounded-lg border border-gray-200 overflow-hidden text-sm">
             {RANGES.map(({ label, value }) => (
@@ -137,7 +168,15 @@ export default function ReportsPage() {
             className="inline-flex items-center gap-1.5 border border-gray-300 px-3 py-1.5 rounded-lg text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-40 transition-colors"
           >
             <Download size={14} />
-            Export CSV
+            CSV
+          </button>
+          <button
+            onClick={exportPDF}
+            disabled={rows.length === 0}
+            className="inline-flex items-center gap-1.5 bg-blue-600 text-white px-3 py-1.5 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-40 transition-colors"
+          >
+            <FileText size={14} />
+            Export PDF
           </button>
         </div>
       </div>
@@ -163,15 +202,29 @@ export default function ReportsPage() {
           </div>
         </div>
         <div className="border border-gray-200 rounded-xl p-5 flex items-start gap-4">
-          <div className="bg-amber-100 text-amber-600 p-2.5 rounded-lg shrink-0">
+          <div className={`p-2.5 rounded-lg shrink-0 ${lowStockCount > 0 ? 'bg-amber-100 text-amber-600' : 'bg-green-100 text-green-600'}`}>
             <Package size={20} />
           </div>
           <div>
             <p className="text-xs text-gray-500 font-medium uppercase tracking-wide">Low stock items</p>
-            <p className="text-2xl font-bold mt-0.5">{lowStockCount}</p>
+            <p className={`text-2xl font-bold mt-0.5 ${lowStockCount > 0 ? 'text-amber-600' : ''}`}>{lowStockCount}</p>
           </div>
         </div>
       </div>
+
+      {/* Low stock warning banner */}
+      {lowStockCount > 0 && (
+        <div className="mb-6 border border-amber-300 bg-amber-50 rounded-xl p-4">
+          <p className="text-sm font-semibold text-amber-800 mb-2">⚠ Low Stock — {lowStockCount} item{lowStockCount !== 1 ? 's' : ''} below {LOW_STOCK_THRESHOLD} units</p>
+          <div className="flex flex-wrap gap-2">
+            {lowStockItems.map(({ product, stock }) => (
+              <span key={product.id} className="text-xs bg-amber-100 text-amber-700 border border-amber-200 rounded-full px-2.5 py-1">
+                {product.name} — {stock} left
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Breakdown table */}
       {loading ? (
@@ -203,7 +256,7 @@ export default function ReportsPage() {
                   <td className="px-4 py-3 text-right">{r.sold}</td>
                   <td className="px-4 py-3 text-right">{r.stocked}</td>
                   <td className="px-4 py-3 text-right font-medium">{r.revenue.toLocaleString()}</td>
-                  <td className={`px-4 py-3 text-right font-medium ${r.netStock < LOW_STOCK ? 'text-amber-600' : 'text-gray-700'}`}>
+                  <td className={`px-4 py-3 text-right font-medium ${r.netStock < LOW_STOCK_THRESHOLD ? 'text-amber-600' : 'text-gray-700'}`}>
                     {r.netStock}
                   </td>
                 </tr>

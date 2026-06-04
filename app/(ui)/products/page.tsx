@@ -4,10 +4,10 @@ import { useEffect, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import * as Label from '@radix-ui/react-label'
 import * as Select from '@radix-ui/react-select'
-import { Camera, ChevronDown, ChevronLeft, ChevronRight, Plus, X } from 'lucide-react'
+import { Camera, ChevronDown, ChevronLeft, ChevronRight, Pencil, Plus, X } from 'lucide-react'
 import { getAll as getProducts, upsertMany } from '@/lib/db/products'
 import { getAll as getCategories, upsertMany as upsertCategories } from '@/lib/db/categories'
-import { seedIfEmpty } from '@/lib/db/seed'
+import { seedIfEmpty, syncFromServer } from '@/lib/db/seed'
 import type { Product, ProductCategory } from '@/lib/types'
 
 const emptyForm = { name: '', sku: '', sellingPrice: '', costPrice: '', categoryId: '', newCategory: '', imageUrl: '' }
@@ -17,6 +17,7 @@ export default function ProductsPage() {
   const [products, setProducts] = useState<Product[]>([])
   const [categories, setCategories] = useState<ProductCategory[]>([])
   const [open, setOpen] = useState(false)
+  const [editingProduct, setEditingProduct] = useState<Product | null>(null)
   const [form, setForm] = useState(emptyForm)
   const [saving, setSaving] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -30,10 +31,24 @@ export default function ProductsPage() {
 
   useEffect(() => {
     async function load() {
-      await seedIfEmpty()
+      // Show whatever is in IndexedDB immediately
       const [cats, prods] = await Promise.all([getCategories(), getProducts()])
-      setCategories(cats)
-      setProducts(prods)
+      if (prods.length > 0) {
+        setCategories(cats)
+        setProducts(prods)
+      } else {
+        await seedIfEmpty()
+        const [c, p] = await Promise.all([getCategories(), getProducts()])
+        setCategories(c)
+        setProducts(p)
+      }
+      // Background sync — update UI if server has fresher data
+      const synced = await syncFromServer()
+      if (synced) {
+        const [c, p] = await Promise.all([getCategories(), getProducts()])
+        setCategories(c)
+        setProducts(p)
+      }
     }
     load()
   }, [])
@@ -57,6 +72,26 @@ export default function ProductsPage() {
       setForm((f) => ({ ...f, [key]: e.target.value }))
   }
 
+  function openAdd() {
+    setEditingProduct(null)
+    setForm(emptyForm)
+    setOpen(true)
+  }
+
+  function openEdit(p: Product) {
+    setEditingProduct(p)
+    setForm({
+      name: p.name,
+      sku: p.sku,
+      sellingPrice: String(p.sellingPrice),
+      costPrice: String(p.costPrice),
+      categoryId: p.categoryId ?? '',
+      newCategory: '',
+      imageUrl: p.imageUrl ?? '',
+    })
+    setOpen(true)
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setSaving(true)
@@ -69,25 +104,53 @@ export default function ProductsPage() {
       categoryId = newCat.id
     }
 
-    const product: Product = {
-      id: crypto.randomUUID(),
-      name: form.name,
-      sku: form.sku,
-      sellingPrice: parseFloat(form.sellingPrice),
-      costPrice: parseFloat(form.costPrice),
-      categoryId,
-      ...(form.imageUrl ? { imageUrl: form.imageUrl } : {}),
+    const categoryName = categories.find((c) => c.id === categoryId)?.name ?? null
+
+    if (editingProduct) {
+      const updated: Product = {
+        ...editingProduct,
+        name: form.name,
+        sku: form.sku,
+        sellingPrice: parseFloat(form.sellingPrice) || 0,
+        costPrice: parseFloat(form.costPrice) || 0,
+        categoryId,
+        ...(form.imageUrl ? { imageUrl: form.imageUrl } : {}),
+      }
+      await upsertMany([updated])
+      await fetch(`/api/products/${editingProduct.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: updated.name,
+          sku: updated.sku,
+          sellingPrice: updated.sellingPrice,
+          costPrice: updated.costPrice,
+          category: categoryName,
+          imageUrl: updated.imageUrl ?? null,
+        }),
+      })
+      setProducts((prev) => prev.map((p) => p.id === updated.id ? updated : p))
+    } else {
+      const product: Product = {
+        id: crypto.randomUUID(),
+        name: form.name,
+        sku: form.sku,
+        sellingPrice: parseFloat(form.sellingPrice) || 0,
+        costPrice: parseFloat(form.costPrice) || 0,
+        categoryId,
+        ...(form.imageUrl ? { imageUrl: form.imageUrl } : {}),
+      }
+      await upsertMany([product])
+      await fetch('/api/products', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([product]),
+      })
+      setProducts((prev) => [...prev, product])
     }
 
-    await upsertMany([product])
-    await fetch('/api/products', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify([product]),
-    })
-
-    setProducts((prev) => [...prev, product])
     setForm(emptyForm)
+    setEditingProduct(null)
     setOpen(false)
     setSaving(false)
   }
@@ -113,7 +176,7 @@ export default function ProductsPage() {
         <h1 className="text-2xl font-semibold tracking-tight">Products</h1>
         <Dialog.Root open={open} onOpenChange={setOpen}>
           <Dialog.Trigger asChild>
-            <button className="inline-flex items-center gap-1.5 bg-blue-600 text-white px-3.5 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors">
+            <button onClick={openAdd} className="inline-flex items-center gap-1.5 bg-blue-600 text-white px-3.5 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors">
               <Plus size={16} />
               Add product
             </button>
@@ -123,7 +186,7 @@ export default function ProductsPage() {
             <Dialog.Overlay className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40" />
             <Dialog.Content className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-xl shadow-2xl p-6 w-full max-w-md z-50 focus:outline-none">
               <div className="flex items-center justify-between mb-5">
-                <Dialog.Title className="text-lg font-semibold">Add product</Dialog.Title>
+                <Dialog.Title className="text-lg font-semibold">{editingProduct ? 'Edit product' : 'Add product'}</Dialog.Title>
                 <Dialog.Close asChild>
                   <button className="text-gray-500 hover:text-gray-600 rounded-md p-1"><X size={18} /></button>
                 </Dialog.Close>
@@ -212,7 +275,7 @@ export default function ProductsPage() {
                   </Dialog.Close>
                   <button type="submit" disabled={saving}
                     className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors">
-                    {saving ? 'Saving…' : 'Save'}
+                    {saving ? 'Saving…' : editingProduct ? 'Update' : 'Save'}
                   </button>
                 </div>
               </form>
@@ -254,6 +317,7 @@ export default function ProductsPage() {
                 <th className="text-left px-4 py-3">Category</th>
                 <th className="text-right px-4 py-3">Selling price</th>
                 <th className="text-right px-4 py-3">Cost price</th>
+                <th className="px-4 py-3 w-10"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
@@ -274,6 +338,13 @@ export default function ProductsPage() {
                   <td className="px-4 py-3 text-gray-500">{categoryMap[p.categoryId] ?? '—'}</td>
                   <td className="px-4 py-3 text-right">{p.sellingPrice.toLocaleString()}</td>
                   <td className="px-4 py-3 text-right text-gray-500">{p.costPrice.toLocaleString()}</td>
+                  <td className="px-4 py-3">
+                    <Dialog.Trigger asChild>
+                      <button onClick={() => openEdit(p)} className="p-1.5 rounded-md text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors">
+                        <Pencil size={14} />
+                      </button>
+                    </Dialog.Trigger>
+                  </td>
                 </tr>
               ))}
             </tbody>

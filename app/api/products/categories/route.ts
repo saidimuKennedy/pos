@@ -10,7 +10,10 @@ export async function GET() {
     });
 
     const categories = rows.map((r) => r.category as string);
-    return Response.json({ data: { categories }, error: null });
+    return Response.json(
+      { data: { categories }, error: null },
+      { headers: { 'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300' } }
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return Response.json({ data: null, error: message }, { status: 500 });

@@ -39,11 +39,10 @@ export async function GET(request: NextRequest) {
     const page = hasMore ? products.slice(0, limit) : products;
     const nextCursor = hasMore ? page[page.length - 1].id : null;
 
-    return Response.json({
-      data: page,
-      meta: { nextCursor, hasMore },
-      error: null,
-    });
+    return Response.json(
+      { data: page, meta: { nextCursor, hasMore }, error: null },
+      { headers: { 'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300' } }
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return Response.json({ data: null, meta: null, error: message }, { status: 500 });

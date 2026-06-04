@@ -1,12 +1,13 @@
 import Link from 'next/link'
-import { BarChart3, LayoutGrid, Package, ShoppingCart, Store } from 'lucide-react'
+import { BarChart3, LayoutGrid, Package, Settings, ShoppingCart, Store } from 'lucide-react'
 
 const nav = [
-  { href: '/products', label: 'Products', icon: Store },
-  { href: '/pos', label: 'POS', icon: ShoppingCart },
-  { href: '/inventory', label: 'Inventory', icon: Package },
-  { href: '/categories', label: 'Categories', icon: LayoutGrid },
-  { href: '/reports', label: 'Reports', icon: BarChart3 },
+  { href: '/products',  label: 'Products',   icon: Store },
+  { href: '/pos',       label: 'POS',        icon: ShoppingCart },
+  { href: '/inventory', label: 'Inventory',  icon: Package },
+  { href: '/categories',label: 'Categories', icon: LayoutGrid },
+  { href: '/reports',   label: 'Reports',    icon: BarChart3 },
+  { href: '/settings',  label: 'Settings',   icon: Settings },
 ]
 
 export default function UILayout({ children }: { children: React.ReactNode }) {

@@ -9,7 +9,7 @@ import { create, getAll as getTransactions } from '@/lib/db/transactions'
 import { push } from '@/lib/db/syncQueue'
 import { getAll as getProducts } from '@/lib/db/products'
 import { getAll as getCategories } from '@/lib/db/categories'
-import { seedIfEmpty } from '@/lib/db/seed'
+import { seedIfEmpty, syncFromServer } from '@/lib/db/seed'
 import type { InventoryTransaction, Product, ProductCategory } from '@/lib/types'
 
 const TYPE_LABELS: Record<string, string> = {
@@ -34,13 +34,26 @@ export default function InventoryPage() {
   const [filterCategoryId, setFilterCategoryId] = useState<string>('all')
   const [saving, setSaving] = useState(false)
 
+  async function refreshLocal() {
+    const [cats, prods, txs] = await Promise.all([getCategories(), getProducts(), getTransactions()])
+    setCategories(cats)
+    setProducts(prods)
+    setTransactions(txs)
+  }
+
   useEffect(() => {
     async function load() {
-      await seedIfEmpty()
       const [cats, prods, txs] = await Promise.all([getCategories(), getProducts(), getTransactions()])
-      setCategories(cats)
-      setProducts(prods)
-      setTransactions(txs)
+      if (prods.length > 0) {
+        setCategories(cats)
+        setProducts(prods)
+        setTransactions(txs)
+      } else {
+        await seedIfEmpty()
+        await refreshLocal()
+      }
+      const synced = await syncFromServer()
+      if (synced) await refreshLocal()
     }
     load()
   }, [])

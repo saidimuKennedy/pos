@@ -1,0 +1,45 @@
+import { NextRequest } from "next/server";
+import { prisma } from "@/lib/server/db";
+
+export async function PATCH(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    const body = await request.json();
+    const { name, sku, sellingPrice, costPrice, category, specification, imageUrl } = body;
+
+    const product = await prisma.product.update({
+      where: { id },
+      data: {
+        ...(name !== undefined && { name }),
+        ...(sku !== undefined && { sku }),
+        ...(sellingPrice !== undefined && { sellingPrice }),
+        ...(costPrice !== undefined && { costPrice }),
+        ...(category !== undefined && { category }),
+        ...(specification !== undefined && { specification }),
+        ...(imageUrl !== undefined && { imageUrl }),
+      },
+    });
+
+    return Response.json({ data: product, error: null });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return Response.json({ data: null, error: message }, { status: 500 });
+  }
+}
+
+export async function DELETE(
+  _request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    await prisma.product.delete({ where: { id } });
+    return Response.json({ data: { id }, error: null });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return Response.json({ data: null, error: message }, { status: 500 });
+  }
+}
