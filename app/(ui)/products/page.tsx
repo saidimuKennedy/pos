@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import * as Label from '@radix-ui/react-label'
 import * as Select from '@radix-ui/react-select'
-import { Camera, ChevronDown, ChevronLeft, ChevronRight, Pencil, Plus, X } from 'lucide-react'
+import { Camera, ChevronDown, ChevronLeft, ChevronRight, Pencil, Plus, Search, X } from 'lucide-react'
 import { getAll as getProducts, upsertMany } from '@/lib/db/products'
 import { getAll as getCategories, upsertMany as upsertCategories } from '@/lib/db/categories'
 import { seedIfEmpty, syncFromServer } from '@/lib/db/seed'
@@ -22,10 +22,16 @@ export default function ProductsPage() {
   const [saving, setSaving] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [filterCategoryId, setFilterCategoryId] = useState<string>('all')
+  const [search, setSearch] = useState('')
   const [page, setPage] = useState(1)
 
   function setFilter(id: string) {
     setFilterCategoryId(id)
+    setPage(1)
+  }
+
+  function handleSearch(q: string) {
+    setSearch(q)
     setPage(1)
   }
 
@@ -164,9 +170,15 @@ export default function ProductsPage() {
   }
 
   const categoryMap = Object.fromEntries(categories.map((c) => [c.id, c.name]))
-  const visible = filterCategoryId === 'all'
-    ? products
-    : products.filter((p) => p.categoryId === filterCategoryId)
+  const q = search.trim().toLowerCase()
+  const visible = products
+    .filter((p) => filterCategoryId === 'all' || p.categoryId === filterCategoryId)
+    .filter((p) =>
+      !q ||
+      p.name.toLowerCase().includes(q) ||
+      p.sku.toLowerCase().includes(q) ||
+      (p.specification ?? '').toLowerCase().includes(q)
+    )
   const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE))
   const paginated = visible.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
 
@@ -307,6 +319,23 @@ export default function ProductsPage() {
         </Dialog.Root>
       </div>
 
+      {/* Search */}
+      <div className="relative mb-4">
+        <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => handleSearch(e.target.value)}
+          placeholder="Search by name, SKU or specification…"
+          className="w-full border border-gray-200 rounded-xl pl-9 pr-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-gray-50 focus:bg-white transition-colors"
+        />
+        {search && (
+          <button onClick={() => handleSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+            <X size={14} />
+          </button>
+        )}
+      </div>
+
       {/* Category filter tabs */}
       {categories.length > 0 && (
         <div className="flex gap-1 mb-4 flex-wrap">
@@ -327,7 +356,14 @@ export default function ProductsPage() {
 
       {visible.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-24 text-gray-500">
-          <p className="text-sm">No products yet — add your first one</p>
+          {search ? (
+            <>
+              <p className="text-sm font-medium">No results for &ldquo;{search}&rdquo;</p>
+              <button onClick={() => handleSearch('')} className="mt-2 text-xs text-blue-600 hover:underline">Clear search</button>
+            </>
+          ) : (
+            <p className="text-sm">No products yet — add your first one</p>
+          )}
         </div>
       ) : (
         <div className="border border-gray-200 rounded-xl overflow-hidden">
