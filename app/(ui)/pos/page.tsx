@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
-import { FileText, ImageOff, Minus, Plus, Search, ShoppingCart, WifiOff, X } from 'lucide-react'
+import * as Select from '@radix-ui/react-select'
+import { AlertCircle, ChevronDown, FileText, ImageOff, Minus, Plus, Search, ShoppingCart, WifiOff, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { create } from '@/lib/db/transactions'
 import { push, drain } from '@/lib/db/syncQueue'
@@ -10,15 +11,25 @@ import { getAll as getProducts } from '@/lib/db/products'
 import { getAll as getCategories } from '@/lib/db/categories'
 import { normalizeQuery } from '@/lib/normalize'
 import { getAll as getTransactions } from '@/lib/db/transactions'
+import { create as createIncident, push as pushIncident, drain as drainIncident } from '@/lib/db/incidents'
 import { seedIfEmpty, syncFromServer } from '@/lib/db/seed'
 import { computeStock, getLowStockItems, LOW_STOCK_THRESHOLD } from '@/lib/stock'
-import type { Product, ProductCategory, InventoryTransaction } from '@/lib/types'
+import { getDeviceId } from '@/lib/device'
+import { INCIDENT_REASON_LABELS } from '@/lib/types'
+import type { Product, ProductCategory, InventoryTransaction, IncidentReason } from '@/lib/types'
 
-type CartItem = Product & { qty: number }
+type CartItem = Product & { qty: number; unitPrice: number }
 
 interface QuoteForm {
   customerName: string
   customerEmail: string
+  note: string
+}
+
+interface IncidentDraft {
+  productId: string
+  productName: string
+  reason: IncidentReason
   note: string
 }
 
@@ -28,22 +39,44 @@ export default function POSPage() {
   const [allTransactions, setAllTransactions] = useState<InventoryTransaction[]>([])
   const [activeCategoryId, setActiveCategoryId] = useState<string>('all')
   const [search, setSearch] = useState('')
-  const [cart, setCart] = useState<CartItem[]>([])
+  const [cart, setCart] = useState<CartItem[]>(() => {
+    // Restore cart from localStorage on mount so it survives tab navigation
+    if (typeof window === 'undefined') return []
+    try {
+      const saved = localStorage.getItem('pos_cart')
+      return saved ? (JSON.parse(saved) as CartItem[]) : []
+    } catch {
+      return []
+    }
+  })
   const [offline, setOffline] = useState(false)
   const [receipt, setReceipt] = useState<{ orderId: string; items: CartItem[]; total: number } | null>(null)
   const [checking, setChecking] = useState(false)
   const [quoteOpen, setQuoteOpen] = useState(false)
   const [quoteForm, setQuoteForm] = useState<QuoteForm>({ customerName: '', customerEmail: '', note: '' })
   const [quoteSending, setQuoteSending] = useState(false)
+  // Incident modal
+  const [incidentOpen, setIncidentOpen] = useState(false)
+  const [incidentSearch, setIncidentSearch] = useState('')
+  const [incidentDrafts, setIncidentDrafts] = useState<IncidentDraft[]>([])
+  const [incidentSaving, setIncidentSaving] = useState(false)
   const alertedIds = useRef<Set<string>>(new Set())
 
+  // Persist cart across navigation
   useEffect(() => {
-    const onOnline = () => { setOffline(false); drain().catch(() => {}) }
+    try {
+      localStorage.setItem('pos_cart', JSON.stringify(cart))
+    } catch { /* storage full — ignore */ }
+  }, [cart])
+
+  useEffect(() => {
+    const onOnline = () => { setOffline(false); drain().catch(() => {}); drainIncident().catch(() => {}) }
     const onOffline = () => setOffline(true)
     setOffline(!navigator.onLine)
     window.addEventListener('online', onOnline)
     window.addEventListener('offline', onOffline)
-    drain().catch(() => {}) // drain any queued transactions from previous offline sessions
+    drain().catch(() => {})
+    drainIncident().catch(() => {})
     return () => {
       window.removeEventListener('online', onOnline)
       window.removeEventListener('offline', onOffline)
@@ -52,7 +85,6 @@ export default function POSPage() {
 
   useEffect(() => {
     async function load() {
-      // Show local data immediately
       const [cats, prods, txs] = await Promise.all([getCategories(), getProducts(), getTransactions()])
       if (prods.length > 0) {
         setCategories(cats)
@@ -67,7 +99,6 @@ export default function POSPage() {
         setAllTransactions(t)
         if (c.length > 0) setActiveCategoryId(c[0].id)
       }
-      // Background sync
       const synced = await syncFromServer()
       if (synced) {
         const [c, p, t] = await Promise.all([getCategories(), getProducts(), getTransactions()])
@@ -77,7 +108,6 @@ export default function POSPage() {
         if (c.length > 0) setActiveCategoryId(c[0].id)
       }
 
-      // Single consolidated toast on load — never spam per-item
       const low = getLowStockItems(prods, txs)
       low.forEach(({ product }) => alertedIds.current.add(product.id))
       if (low.length === 1) {
@@ -109,7 +139,7 @@ export default function POSPage() {
     setCart((prev) => {
       const existing = prev.find((i) => i.id === product.id)
       if (existing) return prev.map((i) => i.id === product.id ? { ...i, qty: i.qty + 1 } : i)
-      return [...prev, { ...product, qty: 1 }]
+      return [...prev, { ...product, qty: 1, unitPrice: product.sellingPrice }]
     })
   }
 
@@ -119,7 +149,21 @@ export default function POSPage() {
     )
   }
 
-  const subtotal = cart.reduce((sum, i) => sum + i.sellingPrice * i.qty, 0)
+  function setItemPrice(id: string, raw: string) {
+    const val = parseFloat(raw)
+    if (isNaN(val)) return
+    setCart((prev) => prev.map((item) => {
+      if (item.id !== id) return item
+      const min = item.lowestPrice ?? item.sellingPrice
+      const max = item.sellingPrice
+      let clamped = val
+      if (val < min) { clamped = min; toast.warning(`Min price for ${item.name} is KES ${min.toLocaleString()}`) }
+      if (val > max) { clamped = max }
+      return { ...item, unitPrice: clamped }
+    }))
+  }
+
+  const subtotal = cart.reduce((sum, i) => sum + i.unitPrice * i.qty, 0)
 
   async function checkout() {
     setChecking(true)
@@ -133,6 +177,7 @@ export default function POSPage() {
         type: 'SALE',
         productId: item.id,
         quantity: item.qty,
+        unitPrice: item.unitPrice,
         orderId,
         createdAt: now,
       }
@@ -145,10 +190,10 @@ export default function POSPage() {
     setAllTransactions(updatedTxs)
     setReceipt({ orderId, items: [...cart], total: subtotal })
     setCart([])
+    localStorage.removeItem('pos_cart')
     setChecking(false)
-    drain().catch(() => {}) // flush to server immediately if online
+    drain().catch(() => {})
 
-    // After checkout: toast only for items that JUST dropped below threshold
     const nowLow = getLowStockItems(products, updatedTxs)
     const newlyLow = nowLow.filter(({ product }) => !alertedIds.current.has(product.id))
     newlyLow.forEach(({ product }) => alertedIds.current.add(product.id))
@@ -178,7 +223,7 @@ export default function POSPage() {
             stock,
           })),
         }),
-      }).catch(() => {/* silent — toast already shown */})
+      }).catch(() => {})
     }
   }
 
@@ -197,7 +242,15 @@ export default function POSPage() {
         note: quoteForm.note || undefined,
         quoteRef,
         date: new Date().toLocaleDateString('en-KE', { year: 'numeric', month: 'long', day: 'numeric' }),
-        items: cart.map((i) => ({ name: i.name, sku: i.sku, specification: i.specification, stockUnit: i.stockUnit, qty: i.qty, unitPrice: i.sellingPrice })),
+        // Use negotiated unitPrice (not sellingPrice) in the quote
+        items: cart.map((i) => ({
+          name: i.name,
+          sku: i.sku,
+          specification: i.specification,
+          stockUnit: i.stockUnit,
+          qty: i.qty,
+          unitPrice: i.unitPrice,
+        })),
       })
       doc.save(`quotation-${quoteRef}.pdf`)
       toast.success('Quotation downloaded', { description: `Ref: ${quoteRef}` })
@@ -207,6 +260,78 @@ export default function POSPage() {
       setQuoteSending(false)
     }
   }
+
+  // Incidents
+  const incidentNq = normalizeQuery(incidentSearch.trim())
+  const incidentProducts = products.filter((p) =>
+    !incidentNq ||
+    normalizeQuery(p.name).includes(incidentNq) ||
+    normalizeQuery(p.sku).includes(incidentNq)
+  )
+
+  function toggleIncidentProduct(p: Product) {
+    setIncidentDrafts((prev) => {
+      if (prev.find((d) => d.productId === p.id)) {
+        return prev.filter((d) => d.productId !== p.id)
+      }
+      return [...prev, { productId: p.id, productName: p.name, reason: 'OUT_OF_STOCK', note: '' }]
+    })
+  }
+
+  function selectAllIncidentProducts() {
+    const visible = incidentProducts
+    const allSelected = visible.every((p) => incidentDrafts.find((d) => d.productId === p.id))
+    if (allSelected) {
+      const visibleIds = new Set(visible.map((p) => p.id))
+      setIncidentDrafts((prev) => prev.filter((d) => !visibleIds.has(d.productId)))
+    } else {
+      setIncidentDrafts((prev) => {
+        const existing = new Set(prev.map((d) => d.productId))
+        const toAdd = visible
+          .filter((p) => !existing.has(p.id))
+          .map((p) => ({ productId: p.id, productName: p.name, reason: 'OUT_OF_STOCK' as IncidentReason, note: '' }))
+        return [...prev, ...toAdd]
+      })
+    }
+  }
+
+  function updateDraft(productId: string, patch: Partial<IncidentDraft>) {
+    setIncidentDrafts((prev) => prev.map((d) => d.productId === productId ? { ...d, ...patch } : d))
+  }
+
+  async function handleSaveIncidents() {
+    if (incidentDrafts.length === 0) {
+      toast.error('Select at least one product')
+      return
+    }
+    setIncidentSaving(true)
+    try {
+      const deviceId = getDeviceId()
+      const now = new Date().toISOString()
+      for (const draft of incidentDrafts) {
+        const inc = {
+          id: crypto.randomUUID(),
+          productId: draft.productId,
+          productName: draft.productName,
+          reason: draft.reason,
+          note: draft.note || undefined,
+          deviceId,
+          createdAt: now,
+        }
+        await createIncident(inc)
+        await pushIncident(inc)
+      }
+      drainIncident().catch(() => {})
+      toast.success(`${incidentDrafts.length} missed sale${incidentDrafts.length !== 1 ? 's' : ''} logged`)
+      setIncidentOpen(false)
+      setIncidentDrafts([])
+      setIncidentSearch('')
+    } finally {
+      setIncidentSaving(false)
+    }
+  }
+
+  const reasonOptions = Object.entries(INCIDENT_REASON_LABELS) as [IncidentReason, string][]
 
   return (
     <div className="flex flex-1 overflow-hidden">
@@ -271,7 +396,6 @@ export default function POSPage() {
                         ? 'border-amber-300 bg-amber-50 hover:border-amber-400'
                         : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50'
                     }`}>
-                    {/* Image */}
                     {p.imageUrl ? (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img src={p.imageUrl} alt={p.name} className="w-full h-28 object-cover" />
@@ -280,7 +404,6 @@ export default function POSPage() {
                         <ImageOff size={22} className="text-gray-300" />
                       </div>
                     )}
-                    {/* Info */}
                     <div className="p-3">
                       <p className="font-medium text-sm leading-snug">{p.name}</p>
                       <p className="text-xs text-gray-400 font-mono mt-0.5">{p.sku}</p>
@@ -288,6 +411,9 @@ export default function POSPage() {
                         <p className="text-xs text-gray-500 mt-0.5">{p.specification}</p>
                       )}
                       <p className="text-blue-600 font-semibold mt-2">KES {p.sellingPrice.toLocaleString()}</p>
+                      {p.lowestPrice != null && (
+                        <p className="text-xs text-amber-600 mt-0.5">Min: KES {p.lowestPrice.toLocaleString()}</p>
+                      )}
                       {isLow && (
                         <p className="text-xs text-amber-600 font-medium mt-1">
                           {stock === 0 ? '⚠ Out of stock' : `⚠ ${stock} ${p.stockUnit ?? 'left'}`}
@@ -318,22 +444,48 @@ export default function POSPage() {
           {cart.length === 0 ? (
             <p className="text-xs text-gray-500 text-center mt-8">Cart is empty</p>
           ) : (
-            cart.map((item) => (
-              <div key={item.id} className="flex items-center gap-2">
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium truncate">{item.name}</p>
-                  <p className="text-xs text-gray-500">KES {item.sellingPrice.toLocaleString()}</p>
+            cart.map((item) => {
+              const isDiscounted = item.unitPrice < item.sellingPrice
+              return (
+                <div key={item.id} className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium truncate">{item.name}</p>
+                      <p className="text-xs text-gray-400">
+                        {isDiscounted
+                          ? <><span className="line-through text-gray-300">KES {item.sellingPrice.toLocaleString()}</span>{' '}<span className="text-amber-600">KES {item.unitPrice.toLocaleString()}</span></>
+                          : `KES ${item.sellingPrice.toLocaleString()}`
+                        }
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button onClick={() => setQty(item.id, -1)} className="p-1 rounded-md hover:bg-gray-200"><Minus size={12} /></button>
+                      <span className="text-sm w-5 text-center">{item.qty}</span>
+                      <button onClick={() => setQty(item.id, 1)} className="p-1 rounded-md hover:bg-gray-200"><Plus size={12} /></button>
+                    </div>
+                    <span className="text-sm font-medium w-16 text-right">
+                      {(item.unitPrice * item.qty).toLocaleString()}
+                    </span>
+                  </div>
+                  {/* Price override input (show only if lowest price is set) */}
+                  {item.lowestPrice != null && (
+                    <div className="flex items-center gap-1.5 pl-0">
+                      <span className="text-xs text-gray-400 shrink-0">Price:</span>
+                      <input
+                        type="number"
+                        min={item.lowestPrice}
+                        max={item.sellingPrice}
+                        step="1"
+                        value={item.unitPrice}
+                        onChange={(e) => setItemPrice(item.id, e.target.value)}
+                        className="w-24 border border-gray-200 rounded px-2 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+                      />
+                      <span className="text-xs text-gray-400">(min {item.lowestPrice.toLocaleString()})</span>
+                    </div>
+                  )}
                 </div>
-                <div className="flex items-center gap-1">
-                  <button onClick={() => setQty(item.id, -1)} className="p-1 rounded-md hover:bg-gray-200"><Minus size={12} /></button>
-                  <span className="text-sm w-5 text-center">{item.qty}</span>
-                  <button onClick={() => setQty(item.id, 1)} className="p-1 rounded-md hover:bg-gray-200"><Plus size={12} /></button>
-                </div>
-                <span className="text-sm font-medium w-16 text-right">
-                  {(item.sellingPrice * item.qty).toLocaleString()}
-                </span>
-              </div>
-            ))
+              )
+            })
           )}
         </div>
 
@@ -357,6 +509,13 @@ export default function POSPage() {
               {checking ? 'Processing…' : 'Checkout'}
             </button>
           </div>
+          <button
+            onClick={() => { setIncidentOpen(true); setIncidentDrafts([]); setIncidentSearch('') }}
+            className="w-full flex items-center justify-center gap-1.5 border border-amber-300 text-amber-700 py-2 rounded-xl text-xs font-medium hover:bg-amber-50 transition-colors"
+          >
+            <AlertCircle size={13} />
+            Log missed sale
+          </button>
         </div>
       </aside>
 
@@ -378,7 +537,12 @@ export default function POSPage() {
                   {receipt.items.map((item) => (
                     <div key={item.id} className="flex justify-between text-sm">
                       <span>{item.name} × {item.qty}</span>
-                      <span>KES {(item.sellingPrice * item.qty).toLocaleString()}</span>
+                      <div className="text-right">
+                        {item.unitPrice < item.sellingPrice && (
+                          <span className="text-xs text-amber-600 mr-1">discounted</span>
+                        )}
+                        <span>KES {(item.unitPrice * item.qty).toLocaleString()}</span>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -437,12 +601,11 @@ export default function POSPage() {
                   className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
                 />
               </div>
-              {/* Preview totals */}
               <div className="bg-gray-50 rounded-lg p-3 text-xs text-gray-600 space-y-1">
                 {cart.map((i) => (
                   <div key={i.id} className="flex justify-between">
                     <span>{i.name} × {i.qty}</span>
-                    <span>KES {(i.sellingPrice * i.qty).toLocaleString()}</span>
+                    <span>KES {(i.unitPrice * i.qty).toLocaleString()}</span>
                   </div>
                 ))}
                 <div className="flex justify-between font-semibold text-gray-800 border-t pt-1 mt-1">
@@ -462,6 +625,125 @@ export default function POSPage() {
               >
                 <FileText size={14} />
                 {quoteSending ? 'Generating…' : 'Download PDF'}
+              </button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      {/* Incident / Missed Sale modal */}
+      <Dialog.Root open={incidentOpen} onOpenChange={setIncidentOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40" />
+          <Dialog.Content className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-xl shadow-2xl p-6 w-full max-w-lg z-50 focus:outline-none max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-4">
+              <Dialog.Title className="text-lg font-semibold">Log Missed Sale</Dialog.Title>
+              <Dialog.Close asChild>
+                <button className="text-gray-500 hover:text-gray-600 p-1 rounded-md"><X size={18} /></button>
+              </Dialog.Close>
+            </div>
+            <p className="text-xs text-gray-500 mb-3">
+              Select the product(s) a customer asked for but did not buy, then choose a reason.
+            </p>
+
+            {/* Search + select all */}
+            <div className="relative mb-2">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
+              <input
+                type="text"
+                value={incidentSearch}
+                onChange={(e) => setIncidentSearch(e.target.value)}
+                placeholder="Search products…"
+                className="w-full border border-gray-200 rounded-lg pl-9 pr-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-gray-50"
+              />
+            </div>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-gray-500">{incidentDrafts.length} selected</span>
+              <button
+                type="button"
+                onClick={selectAllIncidentProducts}
+                className="text-xs text-blue-600 hover:underline"
+              >
+                {incidentProducts.every((p) => incidentDrafts.find((d) => d.productId === p.id))
+                  ? 'Deselect all'
+                  : 'Select all'
+                }
+              </button>
+            </div>
+
+            {/* Product list */}
+            <div className="border border-gray-200 rounded-xl overflow-hidden mb-4 max-h-52 overflow-y-auto">
+              {incidentProducts.length === 0 ? (
+                <p className="text-xs text-gray-400 text-center py-6">No products found</p>
+              ) : (
+                incidentProducts.map((p) => {
+                  const draft = incidentDrafts.find((d) => d.productId === p.id)
+                  const selected = !!draft
+                  return (
+                    <div
+                      key={p.id}
+                      className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-gray-50 transition-colors border-b border-gray-100 last:border-0 ${selected ? 'bg-blue-50' : ''}`}
+                      onClick={() => toggleIncidentProduct(p)}
+                    >
+                      <div className={`w-4 h-4 rounded border-2 shrink-0 flex items-center justify-center ${selected ? 'border-blue-600 bg-blue-600' : 'border-gray-300'}`}>
+                        {selected && <svg className="w-2.5 h-2.5 text-white" fill="currentColor" viewBox="0 0 12 12"><path d="M10 3L5 8.5 2 5.5l-1 1L5 10.5l6-7-1-0.5z"/></svg>}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium truncate">{p.name}</p>
+                        <p className="text-xs text-gray-400 font-mono">{p.sku}</p>
+                      </div>
+                    </div>
+                  )
+                })
+              )}
+            </div>
+
+            {/* Reason/note per selected product */}
+            {incidentDrafts.length > 0 && (
+              <div className="space-y-3 mb-4">
+                <p className="text-xs font-medium text-gray-600 uppercase tracking-wide">Set reasons</p>
+                {incidentDrafts.map((draft) => (
+                  <div key={draft.productId} className="border border-gray-200 rounded-lg p-3 space-y-2">
+                    <p className="text-sm font-medium">{draft.productName}</p>
+                    <Select.Root value={draft.reason} onValueChange={(v) => updateDraft(draft.productId, { reason: v as IncidentReason })}>
+                      <Select.Trigger className="w-full flex items-center justify-between border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <Select.Value />
+                        <Select.Icon><ChevronDown size={14} className="text-gray-500" /></Select.Icon>
+                      </Select.Trigger>
+                      <Select.Portal>
+                        <Select.Content className="bg-white border border-gray-200 rounded-xl shadow-lg z-[70] overflow-hidden">
+                          <Select.Viewport className="p-1">
+                            {reasonOptions.map(([value, label]) => (
+                              <Select.Item key={value} value={value} className="flex items-center px-3 py-2 text-sm rounded-lg cursor-pointer hover:bg-blue-50 focus:bg-blue-50 focus:outline-none">
+                                <Select.ItemText>{label}</Select.ItemText>
+                              </Select.Item>
+                            ))}
+                          </Select.Viewport>
+                        </Select.Content>
+                      </Select.Portal>
+                    </Select.Root>
+                    <input
+                      type="text"
+                      placeholder="Optional note…"
+                      value={draft.note}
+                      onChange={(e) => updateDraft(draft.productId, { note: e.target.value })}
+                      className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              <Dialog.Close asChild>
+                <button className="flex-1 border border-gray-300 py-2.5 rounded-xl text-sm text-gray-700 hover:bg-gray-50 transition-colors">Cancel</button>
+              </Dialog.Close>
+              <button
+                onClick={handleSaveIncidents}
+                disabled={incidentSaving || incidentDrafts.length === 0}
+                className="flex-1 bg-amber-600 text-white py-2.5 rounded-xl text-sm font-medium hover:bg-amber-700 disabled:opacity-40 transition-colors"
+              >
+                {incidentSaving ? 'Saving…' : `Log ${incidentDrafts.length || ''} missed sale${incidentDrafts.length !== 1 ? 's' : ''}`}
               </button>
             </div>
           </Dialog.Content>

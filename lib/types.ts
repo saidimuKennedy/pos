@@ -1,16 +1,17 @@
 export type ProductCategory = {
   id: string
-  name: string // e.g. "Plumbing", "Drills", "Farm Equipment"
+  name: string
 }
 
 export type Product = {
   id: string
   name: string
   sku: string
-  specification?: string   // size/variant e.g. "250ml", "32mm", "3/4"
-  stockUnit?: string       // unit label e.g. "pcs", "box", "pkt", "roll"
+  specification?: string
+  stockUnit?: string
   sellingPrice: number
   costPrice: number
+  lowestPrice?: number
   categoryId: string
   imageUrl?: string
   initialStock?: number
@@ -24,7 +25,27 @@ export type InventoryTransaction = {
   type: TransactionType
   productId: string
   quantity: number
+  unitPrice?: number
   orderId?: string
-  createdAt: string       // ISO 8601
-  product?: Product       // optional join, populated by API responses
+  createdAt: string
+  product?: Product
+}
+
+export type IncidentReason = 'OUT_OF_STOCK' | 'PRICE_TOO_HIGH' | 'NOT_AVAILABLE' | 'OTHER'
+
+export const INCIDENT_REASON_LABELS: Record<IncidentReason, string> = {
+  OUT_OF_STOCK:  'Out of stock',
+  PRICE_TOO_HIGH:'Price too high',
+  NOT_AVAILABLE: 'Not available',
+  OTHER:         'Other',
+}
+
+export type Incident = {
+  id: string
+  productId?: string
+  productName: string
+  reason: IncidentReason
+  note?: string
+  deviceId: string
+  createdAt: string
 }

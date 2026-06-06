@@ -5,23 +5,33 @@ import * as Dialog from '@radix-ui/react-dialog'
 import * as Label from '@radix-ui/react-label'
 import * as Select from '@radix-ui/react-select'
 import { Camera, ChevronDown, ChevronLeft, ChevronRight, Pencil, Plus, Search, X } from 'lucide-react'
+import { toast } from 'sonner'
 import { getAll as getProducts, upsertMany } from '@/lib/db/products'
 import { getAll as getCategories, upsertMany as upsertCategories } from '@/lib/db/categories'
+import { create as createTx, getAll as getTransactions } from '@/lib/db/transactions'
+import { push as pushTx, drain } from '@/lib/db/syncQueue'
 import { seedIfEmpty, syncFromServer } from '@/lib/db/seed'
 import { cleanProductName, normalizeQuery, skuFromName } from '@/lib/normalize'
-import type { Product, ProductCategory } from '@/lib/types'
+import { computeStock } from '@/lib/stock'
+import type { Product, ProductCategory, InventoryTransaction } from '@/lib/types'
 
-const emptyForm = { name: '', sku: '', specification: '', stockUnit: 'pcs', sellingPrice: '', costPrice: '', categoryId: '', newCategory: '', imageUrl: '' }
+const emptyForm = {
+  name: '', sku: '', specification: '', stockUnit: 'pcs',
+  sellingPrice: '', costPrice: '', lowestPrice: '',
+  openingStock: '', addStock: '', categoryId: '', newCategory: '', imageUrl: '',
+}
 const PAGE_SIZE = 20
 
 export default function ProductsPage() {
   const [products, setProducts] = useState<Product[]>([])
   const [categories, setCategories] = useState<ProductCategory[]>([])
+  const [transactions, setTransactions] = useState<InventoryTransaction[]>([])
   const [open, setOpen] = useState(false)
   const [editingProduct, setEditingProduct] = useState<Product | null>(null)
   const [form, setForm] = useState(emptyForm)
   const [saving, setSaving] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [dupWarning, setDupWarning] = useState<string[]>([])
   const skuTouched = useRef(false)
   const [filterCategoryId, setFilterCategoryId] = useState<string>('all')
   const [search, setSearch] = useState('')
@@ -39,23 +49,18 @@ export default function ProductsPage() {
 
   useEffect(() => {
     async function load() {
-      // Show whatever is in IndexedDB immediately
-      const [cats, prods] = await Promise.all([getCategories(), getProducts()])
+      const [cats, prods, txs] = await Promise.all([getCategories(), getProducts(), getTransactions()])
       if (prods.length > 0) {
-        setCategories(cats)
-        setProducts(prods)
+        setCategories(cats); setProducts(prods); setTransactions(txs)
       } else {
         await seedIfEmpty()
-        const [c, p] = await Promise.all([getCategories(), getProducts()])
-        setCategories(c)
-        setProducts(p)
+        const [c, p, t] = await Promise.all([getCategories(), getProducts(), getTransactions()])
+        setCategories(c); setProducts(p); setTransactions(t)
       }
-      // Background sync — update UI if server has fresher data
       const synced = await syncFromServer()
       if (synced) {
-        const [c, p] = await Promise.all([getCategories(), getProducts()])
-        setCategories(c)
-        setProducts(p)
+        const [c, p, t] = await Promise.all([getCategories(), getProducts(), getTransactions()])
+        setCategories(c); setProducts(p); setTransactions(t)
       }
     }
     load()
@@ -80,6 +85,15 @@ export default function ProductsPage() {
       setForm((f) => ({ ...f, [key]: e.target.value }))
   }
 
+  function checkDuplicates(name: string) {
+    if (!name.trim() || editingProduct) { setDupWarning([]); return }
+    const nq = normalizeQuery(name)
+    const matches = products
+      .filter((p) => normalizeQuery(p.name).includes(nq) || nq.includes(normalizeQuery(p.name)))
+      .map((p) => p.name)
+    setDupWarning(matches.slice(0, 3))
+  }
+
   function handleNameChange(e: React.ChangeEvent<HTMLInputElement>) {
     const name = e.target.value
     setForm((f) => ({
@@ -87,6 +101,7 @@ export default function ProductsPage() {
       name,
       ...(!skuTouched.current && { sku: skuFromName(name, f.specification) }),
     }))
+    checkDuplicates(name)
   }
 
   function handleNameBlur(e: React.FocusEvent<HTMLInputElement>) {
@@ -96,6 +111,7 @@ export default function ProductsPage() {
       name: cleaned,
       ...(!skuTouched.current && { sku: skuFromName(cleaned, f.specification) }),
     }))
+    checkDuplicates(cleaned)
   }
 
   function handleSpecChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -116,12 +132,14 @@ export default function ProductsPage() {
     skuTouched.current = false
     setEditingProduct(null)
     setForm(emptyForm)
+    setDupWarning([])
     setOpen(true)
   }
 
   function openEdit(p: Product) {
     skuTouched.current = true
     setEditingProduct(p)
+    setDupWarning([])
     setForm({
       name: p.name,
       sku: p.sku,
@@ -129,6 +147,9 @@ export default function ProductsPage() {
       stockUnit: p.stockUnit ?? 'pcs',
       sellingPrice: String(p.sellingPrice),
       costPrice: String(p.costPrice),
+      lowestPrice: p.lowestPrice != null ? String(p.lowestPrice) : '',
+      openingStock: '',
+      addStock: '',
       categoryId: p.categoryId ?? '',
       newCategory: '',
       imageUrl: p.imageUrl ?? '',
@@ -140,69 +161,141 @@ export default function ProductsPage() {
     e.preventDefault()
     setSaving(true)
 
-    let categoryId = form.categoryId
-    if (!categoryId && form.newCategory.trim()) {
-      const newCat: ProductCategory = { id: crypto.randomUUID(), name: form.newCategory.trim() }
-      await upsertCategories([newCat])
-      setCategories((prev) => [...prev, newCat])
-      categoryId = newCat.id
-    }
-
-    const categoryName = categories.find((c) => c.id === categoryId)?.name ?? null
-
-    if (editingProduct) {
-      const updated: Product = {
-        ...editingProduct,
-        name: form.name,
-        sku: form.sku,
-        specification: form.specification || undefined,
-        stockUnit: form.stockUnit || undefined,
-        sellingPrice: parseFloat(form.sellingPrice) || 0,
-        costPrice: parseFloat(form.costPrice) || 0,
-        categoryId,
-        ...(form.imageUrl ? { imageUrl: form.imageUrl } : {}),
+    try {
+      let categoryId = form.categoryId
+      if (!categoryId && form.newCategory.trim()) {
+        const newCat: ProductCategory = { id: crypto.randomUUID(), name: form.newCategory.trim() }
+        await upsertCategories([newCat])
+        setCategories((prev) => [...prev, newCat])
+        categoryId = newCat.id
       }
-      await upsertMany([updated])
-      await fetch(`/api/products/${editingProduct.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: updated.name,
-          sku: updated.sku,
-          specification: updated.specification ?? null,
-          stockUnit: updated.stockUnit ?? null,
-          sellingPrice: updated.sellingPrice,
-          costPrice: updated.costPrice,
-          category: categoryName,
-          imageUrl: updated.imageUrl ?? null,
-        }),
-      })
-      setProducts((prev) => prev.map((p) => p.id === updated.id ? updated : p))
-    } else {
-      const product: Product = {
-        id: crypto.randomUUID(),
-        name: form.name,
-        sku: form.sku,
-        specification: form.specification || undefined,
-        stockUnit: form.stockUnit || undefined,
-        sellingPrice: parseFloat(form.sellingPrice) || 0,
-        costPrice: parseFloat(form.costPrice) || 0,
-        categoryId,
-        ...(form.imageUrl ? { imageUrl: form.imageUrl } : {}),
-      }
-      await upsertMany([product])
-      await fetch('/api/products', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify([product]),
-      })
-      setProducts((prev) => [...prev, product])
-    }
 
-    setForm(emptyForm)
-    setEditingProduct(null)
-    setOpen(false)
-    setSaving(false)
+      const categoryName = categories.find((c) => c.id === categoryId)?.name ?? null
+      const sellingPrice = parseFloat(form.sellingPrice) || 0
+      const costPrice = parseFloat(form.costPrice) || 0
+      const lowestPrice = form.lowestPrice.trim() ? parseFloat(form.lowestPrice) : undefined
+
+      if (lowestPrice !== undefined && lowestPrice > sellingPrice) {
+        toast.error('Lowest price cannot exceed selling price')
+        return
+      }
+
+      if (editingProduct) {
+        const updated: Product = {
+          ...editingProduct,
+          name: form.name,
+          sku: form.sku,
+          specification: form.specification || undefined,
+          stockUnit: form.stockUnit || undefined,
+          sellingPrice,
+          costPrice,
+          lowestPrice,
+          categoryId,
+          ...(form.imageUrl ? { imageUrl: form.imageUrl } : {}),
+        }
+        await upsertMany([updated])
+        await fetch(`/api/products/${editingProduct.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: updated.name,
+            sku: updated.sku,
+            specification: updated.specification ?? null,
+            stockUnit: updated.stockUnit ?? null,
+            sellingPrice: updated.sellingPrice,
+            costPrice: updated.costPrice,
+            lowestPrice: updated.lowestPrice ?? null,
+            category: categoryName,
+            imageUrl: updated.imageUrl ?? null,
+          }),
+        })
+        setProducts((prev) => prev.map((p) => p.id === updated.id ? updated : p))
+
+        // Restock if requested
+        const addQty = parseInt(form.addStock, 10)
+        if (addQty > 0) {
+          const tx: InventoryTransaction = {
+            id: crypto.randomUUID(),
+            type: 'STOCK_IN',
+            productId: updated.id,
+            quantity: addQty,
+            createdAt: new Date().toISOString(),
+          }
+          await createTx(tx)
+          await pushTx(tx)
+          drain().catch(() => {})
+          setTransactions((prev) => [tx, ...prev])
+          toast.success(`Product updated — +${addQty} ${updated.stockUnit ?? 'units'} added to stock`)
+        } else {
+          toast.success('Product updated')
+        }
+      } else {
+        // Check for SKU collision in IDB before attempting insert
+        const existing = products.find((p) => p.sku === form.sku)
+        if (existing) {
+          toast.error(`SKU "${form.sku}" is already used by "${existing.name}"`)
+          return
+        }
+
+        const product: Product = {
+          id: crypto.randomUUID(),
+          name: form.name,
+          sku: form.sku,
+          specification: form.specification || undefined,
+          stockUnit: form.stockUnit || undefined,
+          sellingPrice,
+          costPrice,
+          lowestPrice,
+          categoryId,
+          ...(form.imageUrl ? { imageUrl: form.imageUrl } : {}),
+        }
+        await upsertMany([product])
+
+        // Record opening stock as a STOCK_IN transaction
+        const openingQty = parseInt(form.openingStock, 10)
+        if (openingQty > 0) {
+          const tx: InventoryTransaction = {
+            id: crypto.randomUUID(),
+            type: 'STOCK_IN',
+            productId: product.id,
+            quantity: openingQty,
+            createdAt: new Date().toISOString(),
+          }
+          await createTx(tx)
+          await pushTx(tx)
+          drain().catch(() => {})
+          setTransactions((prev) => [tx, ...prev])
+        }
+
+        await fetch('/api/products', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: product.id,
+            name: product.name,
+            sku: product.sku,
+            specification: product.specification ?? null,
+            stockUnit: product.stockUnit ?? null,
+            sellingPrice: product.sellingPrice,
+            costPrice: product.costPrice,
+            lowestPrice: product.lowestPrice ?? null,
+            category: categoryName,
+            imageUrl: product.imageUrl ?? null,
+          }),
+        })
+        setProducts((prev) => [...prev, product])
+        toast.success('Product saved')
+      }
+
+      setForm(emptyForm)
+      setEditingProduct(null)
+      setDupWarning([])
+      setOpen(false)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to save product')
+    } finally {
+      setSaving(false)
+    }
   }
 
   const categoryMap = Object.fromEntries(categories.map((c) => [c.id, c.name]))
@@ -240,7 +333,7 @@ export default function ProductsPage() {
 
           <Dialog.Portal>
             <Dialog.Overlay className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40" />
-            <Dialog.Content className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-xl shadow-2xl p-6 w-full max-w-md z-50 focus:outline-none">
+            <Dialog.Content className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-xl shadow-2xl p-6 w-full max-w-md z-50 focus:outline-none max-h-[90vh] overflow-y-auto">
               <div className="flex items-center justify-between mb-5">
                 <Dialog.Title className="text-lg font-semibold">{editingProduct ? 'Edit product' : 'Add product'}</Dialog.Title>
                 <Dialog.Close asChild>
@@ -272,6 +365,11 @@ export default function ProductsPage() {
                   <Label.Root htmlFor="p-name" className="text-sm font-medium text-gray-700">Name</Label.Root>
                   <input id="p-name" required value={form.name} onChange={handleNameChange} onBlur={handleNameBlur}
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  {dupWarning.length > 0 && (
+                    <p className="text-xs text-amber-600">
+                      Similar product already exists: {dupWarning.join(', ')}
+                    </p>
+                  )}
                 </div>
 
                 <div className="space-y-1.5">
@@ -307,6 +405,45 @@ export default function ProductsPage() {
                       className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
                   </div>
                 </div>
+
+                <div className="space-y-1.5">
+                  <Label.Root htmlFor="p-lowest" className="text-sm font-medium text-gray-700">
+                    Lowest price <span className="text-gray-400 font-normal">(minimum negotiable price — optional)</span>
+                  </Label.Root>
+                  <input id="p-lowest" type="number" min="0" step="0.01" value={form.lowestPrice} onChange={field('lowestPrice')}
+                    placeholder="Leave blank to disable discounts"
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+
+                {!editingProduct ? (
+                  <div className="space-y-1.5">
+                    <Label.Root htmlFor="p-stock" className="text-sm font-medium text-gray-700">
+                      Opening stock <span className="text-gray-400 font-normal">(units you have right now)</span>
+                    </Label.Root>
+                    <input id="p-stock" type="number" min="0" step="1" value={form.openingStock} onChange={field('openingStock')}
+                      placeholder="0"
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    {(() => {
+                      const currentStock = computeStock(editingProduct.id, transactions, editingProduct.initialStock ?? 0)
+                      return (
+                        <>
+                          <div className="flex items-center justify-between">
+                            <Label.Root htmlFor="p-addstock" className="text-sm font-medium text-gray-700">Add stock</Label.Root>
+                            <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${currentStock <= 0 ? 'bg-red-100 text-red-700' : currentStock < 5 ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700'}`}>
+                              Currently: {currentStock} {editingProduct.stockUnit ?? 'units'}
+                            </span>
+                          </div>
+                          <input id="p-addstock" type="number" min="1" step="1" value={form.addStock} onChange={field('addStock')}
+                            placeholder="Enter qty to add (optional)"
+                            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                        </>
+                      )
+                    })()}
+                  </div>
+                )}
 
                 <div className="space-y-1.5">
                   <Label.Root className="text-sm font-medium text-gray-700">Category</Label.Root>
@@ -411,7 +548,9 @@ export default function ProductsPage() {
                 <th className="text-left px-4 py-3">Spec / Size</th>
                 <th className="text-left px-4 py-3">SKU</th>
                 <th className="text-left px-4 py-3">Category</th>
+                <th className="text-right px-4 py-3">In stock</th>
                 <th className="text-right px-4 py-3">Selling price</th>
+                <th className="text-right px-4 py-3">Lowest price</th>
                 <th className="text-right px-4 py-3">Cost price</th>
                 <th className="px-4 py-3 w-10"></th>
               </tr>
@@ -438,7 +577,20 @@ export default function ProductsPage() {
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-gray-500">{p.sku}</td>
                   <td className="px-4 py-3 text-gray-500">{categoryMap[p.categoryId] ?? '—'}</td>
+                  <td className="px-4 py-3 text-right">
+                    {(() => {
+                      const s = computeStock(p.id, transactions, p.initialStock ?? 0)
+                      return (
+                        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s <= 0 ? 'bg-red-100 text-red-700' : s < 5 ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700'}`}>
+                          {s <= 0 ? '⚠ Out' : `${s} ${p.stockUnit ?? ''}`}
+                        </span>
+                      )
+                    })()}
+                  </td>
                   <td className="px-4 py-3 text-right">{p.sellingPrice.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-right text-amber-600 text-xs">
+                    {p.lowestPrice != null ? p.lowestPrice.toLocaleString() : <span className="text-gray-300">—</span>}
+                  </td>
                   <td className="px-4 py-3 text-right text-gray-500">{p.costPrice.toLocaleString()}</td>
                   <td className="px-4 py-3">
                     <button onClick={() => openEdit(p)} className="p-1.5 rounded-md text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors">

@@ -46,6 +46,7 @@ export async function syncFromServer(): Promise<boolean> {
           sku: p.sku,
           sellingPrice: Number(p.sellingPrice),
           costPrice: Number(p.costPrice),
+          lowestPrice: p.lowestPrice != null ? Number(p.lowestPrice) : undefined,
           categoryId: p.category ? slugify(p.category) : 'uncategorised',
           imageUrl: p.imageUrl ?? undefined,
           initialStock: parseInitialStock(p.quantity),

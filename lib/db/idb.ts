@@ -1,11 +1,9 @@
-// Shared IDB helper — opens the "pos" database with all three object stores.
-// Version must be bumped here whenever a new store is added.
-
 // Shared IDB helper — opens the "pos" database with all object stores.
-// Bump DB_VERSION whenever a store or index is added.
+// IMPORTANT: onupgradeneeded uses oldVersion to apply only the needed changes.
+// Never unconditionally drop stores — that wipes user data.
 
 const DB_NAME = 'pos'
-const DB_VERSION = 4
+const DB_VERSION = 5
 
 let dbPromise: Promise<IDBDatabase> | null = null
 
@@ -17,18 +15,25 @@ export function openDb(): Promise<IDBDatabase> {
 
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result
-      const upgradeTx = (event.target as IDBOpenDBRequest).transaction!
+      const oldVersion = event.oldVersion
 
-      // v3: drop and recreate products + categories to pick up full seed data
-      if (db.objectStoreNames.contains('products')) db.deleteObjectStore('products')
-      if (db.objectStoreNames.contains('categories')) db.deleteObjectStore('categories')
+      // v1→v3: initial schema or early versions — safe to recreate core stores
+      // (these installs never had real user data)
+      if (oldVersion < 3) {
+        if (db.objectStoreNames.contains('products')) db.deleteObjectStore('products')
+        if (db.objectStoreNames.contains('categories')) db.deleteObjectStore('categories')
+      }
 
-      const catStore = db.createObjectStore('categories', { keyPath: 'id' })
-      catStore.createIndex('name', 'name', { unique: true })
+      if (!db.objectStoreNames.contains('categories')) {
+        const catStore = db.createObjectStore('categories', { keyPath: 'id' })
+        catStore.createIndex('name', 'name', { unique: true })
+      }
 
-      const prodStore = db.createObjectStore('products', { keyPath: 'id' })
-      prodStore.createIndex('categoryId', 'categoryId')
-      prodStore.createIndex('sku', 'sku', { unique: true })
+      if (!db.objectStoreNames.contains('products')) {
+        const prodStore = db.createObjectStore('products', { keyPath: 'id' })
+        prodStore.createIndex('categoryId', 'categoryId')
+        prodStore.createIndex('sku', 'sku', { unique: true })
+      }
 
       if (!db.objectStoreNames.contains('transactions')) {
         const store = db.createObjectStore('transactions', { keyPath: 'id' })
@@ -38,6 +43,17 @@ export function openDb(): Promise<IDBDatabase> {
 
       if (!db.objectStoreNames.contains('syncQueue')) {
         db.createObjectStore('syncQueue', { keyPath: 'id' })
+      }
+
+      // v5: incidents + incidentQueue
+      if (!db.objectStoreNames.contains('incidents')) {
+        const inc = db.createObjectStore('incidents', { keyPath: 'id' })
+        inc.createIndex('productId', 'productId')
+        inc.createIndex('createdAt', 'createdAt')
+      }
+
+      if (!db.objectStoreNames.contains('incidentQueue')) {
+        db.createObjectStore('incidentQueue', { keyPath: 'id' })
       }
     }
 

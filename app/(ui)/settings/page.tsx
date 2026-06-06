@@ -70,10 +70,10 @@ export default function SettingsPage() {
         lowStockCount: 2,
         grossMargin: 34.2,
         rows: [
-          { name: 'Copper Pipe 1/2"', sku: 'PL-001', category: 'Plumbing', sold: 18, stocked: 30, revenue: 54000, netStock: 12 },
-          { name: 'Ball Valve 3/4"',  sku: 'PL-004', category: 'Plumbing', sold: 12, stocked: 20, revenue: 36000, netStock: 8  },
-          { name: 'Drill Bit Set',    sku: 'DR-007', category: 'Tools',    sold: 8,  stocked: 5,  revenue: 40000, netStock: 3  },
-          { name: 'Gate Valve 1"',    sku: 'PL-009', category: 'Plumbing', sold: 4,  stocked: 10, revenue: 18500, netStock: 4  },
+          { name: 'Copper Pipe 1/2"', sku: 'PL-001', category: 'Plumbing', sold: 18, stocked: 30, listRevenue: 54000, revenue: 54000, netStock: 12 },
+          { name: 'Ball Valve 3/4"',  sku: 'PL-004', category: 'Plumbing', sold: 12, stocked: 20, listRevenue: 36000, revenue: 34000, netStock: 8  },
+          { name: 'Drill Bit Set',    sku: 'DR-007', category: 'Tools',    sold: 8,  stocked: 5,  listRevenue: 40000, revenue: 40000, netStock: 3  },
+          { name: 'Gate Valve 1"',    sku: 'PL-009', category: 'Plumbing', sold: 4,  stocked: 10, listRevenue: 18500, revenue: 18500, netStock: 4  },
         ],
         lowStockItems: [
           { name: 'Drill Bit Set', sku: 'DR-007', stock: 3 },

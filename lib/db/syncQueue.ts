@@ -31,6 +31,7 @@ export async function drain(): Promise<void> {
     // server enum doesn't have STOCK_IN — map to PURCHASE
     type: tx.type === 'STOCK_IN' ? 'PURCHASE' : tx.type,
     quantity: tx.quantity,
+    unitPrice: tx.unitPrice ?? null,
     deviceId,
     createdAt: tx.createdAt,
   }))

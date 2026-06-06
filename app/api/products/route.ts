@@ -52,7 +52,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { name, sku, sellingPrice, costPrice, imageUrl, category, specification, stockUnit } = body;
+    const { id, name, sku, sellingPrice, costPrice, lowestPrice, imageUrl, category, specification, stockUnit } = body;
 
     if (!name || !sku || sellingPrice == null || costPrice == null) {
       return Response.json(
@@ -63,10 +63,15 @@ export async function POST(request: NextRequest) {
 
     const product = await prisma.product.create({
       data: {
+        // Use the client-generated UUID so IDB and server share the same id.
+        // Without this, the server mints a new UUID and stock transactions
+        // (which reference the client UUID) become orphaned on re-sync.
+        ...(id ? { id } : {}),
         name,
         sku,
         sellingPrice,
         costPrice,
+        lowestPrice: lowestPrice ?? null,
         imageUrl: imageUrl ?? null,
         category: category ?? null,
         specification: specification ?? null,

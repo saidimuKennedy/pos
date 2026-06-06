@@ -220,18 +220,27 @@ export interface COBReportRow {
   category: string
   sold: number
   stocked: number
-  revenue: number
+  listRevenue: number
+  revenue: number   // actual (negotiated) revenue
   netStock: number
+}
+
+export interface MissedSaleRow {
+  productName: string
+  count: number
+  reasons: string // human-readable summary
 }
 
 export interface COBReportData {
   dateLabel: string
-  revenue: number
+  revenue: number       // actual revenue
+  listRevenue?: number  // at-list revenue (for discount section)
   unitsSold: number
   lowStockCount: number
-  grossMargin?: number  // optional, percentage 0-100
+  grossMargin?: number
   rows: COBReportRow[]
   lowStockItems: Array<{ name: string; sku: string; stock: number }>
+  missedSales?: MissedSaleRow[]
 }
 
 export function generateCOBReportPDF(data: COBReportData): jsPDF {
@@ -249,12 +258,15 @@ export function generateCOBReportPDF(data: COBReportData): jsPDF {
 
   // ── Key Performance Indicators section
   y = drawSectionHeader(doc, 'Key Performance Indicators', y, primary)
+  const discountGiven = data.listRevenue != null ? data.listRevenue - data.revenue : 0
   const kpis: Array<{ label: string; value: string }> = [
-    { label: 'Revenue',        value: `${cur} ${data.revenue.toLocaleString()}` },
-    { label: 'Units Sold',     value: data.unitsSold.toLocaleString() },
-    { label: 'Low Stock Items',value: String(data.lowStockCount) },
+    { label: 'Actual Revenue',  value: `${cur} ${data.revenue.toLocaleString()}` },
+    { label: 'Units Sold',      value: data.unitsSold.toLocaleString() },
+    { label: 'Low Stock Items', value: String(data.lowStockCount) },
   ]
-  if (data.grossMargin !== undefined) {
+  if (data.listRevenue != null && discountGiven > 0) {
+    kpis.push({ label: 'Discount Given', value: `−${cur} ${discountGiven.toLocaleString()}` })
+  } else if (data.grossMargin !== undefined) {
     kpis.push({ label: 'Gross Margin', value: `${data.grossMargin.toFixed(1)}%` })
   }
   y = drawKPIRow(doc, kpis, y)
@@ -279,33 +291,39 @@ export function generateCOBReportPDF(data: COBReportData): jsPDF {
 
   // ── Product Breakdown table
   y = drawSectionHeader(doc, 'Product Breakdown', y, primary)
+  const showBothPrices = data.rows.some((r) => r.listRevenue !== r.revenue)
   autoTable(doc, {
     startY: y,
-    head: [['Product', 'Spec', 'SKU', 'Category', 'Sold', 'Stocked', `Revenue (${cur})`, 'Net Stock']],
-    body: data.rows.map((r) => [
-      r.name,
-      r.specification ?? '—',
-      r.sku,
-      r.category,
-      `${r.sold}${r.stockUnit ? ' ' + r.stockUnit : ''}`,
-      `${r.stocked}${r.stockUnit ? ' ' + r.stockUnit : ''}`,
-      r.revenue.toLocaleString(),
-      {
+    head: [showBothPrices
+      ? ['Product', 'Spec', 'SKU', 'Category', 'Sold', 'Stocked', `List Rev (${cur})`, `Actual Rev (${cur})`, 'Net Stock']
+      : ['Product', 'Spec', 'SKU', 'Category', 'Sold', 'Stocked', `Revenue (${cur})`, 'Net Stock']
+    ],
+    body: data.rows.map((r) => {
+      const base = [
+        r.name,
+        r.specification ?? '—',
+        r.sku,
+        r.category,
+        `${r.sold}${r.stockUnit ? ' ' + r.stockUnit : ''}`,
+        `${r.stocked}${r.stockUnit ? ' ' + r.stockUnit : ''}`,
+      ]
+      const netStockCell = {
         content: r.netStock,
         styles: {
           textColor: r.netStock < 5 ? ([180, 83, 9] as RGB) : DARK,
           fontStyle: r.netStock < 5 ? ('bold' as const) : ('normal' as const),
         },
-      },
-    ]),
+      }
+      if (showBothPrices) {
+        return [...base, r.listRevenue.toLocaleString(), r.revenue.toLocaleString(), netStockCell]
+      }
+      return [...base, r.revenue.toLocaleString(), netStockCell]
+    }),
     headStyles: { fillColor: primary, textColor: WHITE, fontSize: 8 },
     bodyStyles: { fontSize: 8 },
-    columnStyles: {
-      4: { halign: 'right' },
-      5: { halign: 'right' },
-      6: { halign: 'right' },
-      7: { halign: 'right' },
-    },
+    columnStyles: showBothPrices
+      ? { 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' }, 8: { halign: 'right' } }
+      : { 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' } },
     alternateRowStyles: { fillColor: [249, 250, 251] },
     margin: { left: MARGIN, right: MARGIN },
   })
@@ -332,6 +350,32 @@ export function generateCOBReportPDF(data: COBReportData): jsPDF {
       body: data.lowStockItems.map((i) => [i.name, i.sku, i.stock]),
       headStyles: { fillColor: amber, textColor: WHITE, fontSize: 8 },
       bodyStyles: { fontSize: 8, textColor: [180, 83, 9] as RGB },
+      margin: { left: MARGIN, right: MARGIN },
+    })
+  }
+
+  // ── Missed Sales / Action Points
+  if (data.missedSales && data.missedSales.length > 0) {
+    const orange: RGB = [234, 88, 12]
+    const orangeBg: RGB = [255, 237, 213]
+    const prevFinalY = (doc as jsPDF & { lastAutoTable: { finalY: number } }).lastAutoTable?.finalY
+    let msy = (prevFinalY ?? 250) + 10
+
+    doc.setFillColor(...orangeBg)
+    doc.roundedRect(MARGIN, msy, CONTENT, 10, 1.5, 1.5, 'F')
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(10)
+    doc.setTextColor(...orange)
+    doc.text('Missed Sales - Action Points', MARGIN + 5, msy + 6.8)
+    msy += 14
+
+    autoTable(doc, {
+      startY: msy,
+      head: [['Product', 'Times Missed', 'Reasons']],
+      body: data.missedSales.map((r) => [r.productName, r.count, r.reasons]),
+      headStyles: { fillColor: orange, textColor: WHITE, fontSize: 8 },
+      bodyStyles: { fontSize: 8, textColor: DARK },
+      columnStyles: { 1: { halign: 'right' } },
       margin: { left: MARGIN, right: MARGIN },
     })
   }
